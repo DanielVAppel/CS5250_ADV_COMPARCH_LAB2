@@ -66,7 +66,30 @@ typedef struct Pipe_Op {
  * and the stage must not overwrite its output (otherwise an instruction would
  * be lost).
  */
+/* ---------------- Cache Types ---------------- */
 
+typedef struct {
+    uint32_t tag;
+    int valid;
+    int dirty;              /* used for data cache */
+    uint32_t lru_counter;   /* larger = more recent */
+} CacheBlock;
+
+typedef struct {
+    CacheBlock *blocks;     /* array of ways */
+    int num_ways;
+} CacheSet;
+
+typedef struct {
+    CacheSet *sets;
+    int num_sets;           /* e.g., 64 for I$, 256 for D$ */
+    int num_ways;           /* associativity: 4 for I$, 8 for D$ */
+    int block_size;         /* 32 bytes */
+
+    /* derived fields for address slicing */
+    int offset_bits;        /* log2(block_size) = 5 */
+    int index_bits;         /* log2(num_sets) = 6 for I$, 8 for D$ */
+} Cache;
 typedef struct Pipe_State {
     /* pipe op currently at the input of the given stage (NULL for none) */
     Pipe_Op *decode_op, *execute_op, *mem_op, *wb_op;
@@ -88,6 +111,11 @@ typedef struct Pipe_State {
     /* multiplier stall info */
     int multiplier_stall; /* number of remaining cycles until HI/LO are ready */
 
+    /* --------- NEW: cache + stall state ---------- */
+    Cache icache;        /* 8KB, 32B blocks, 4-way => 64 sets */
+    Cache dcache;        /* 64KB, 32B blocks, 8-way => 256 sets */
+    int icache_stall;    /* remaining stall cycles for I$ miss */
+    int dcache_stall;    /* remaining stall cycles for D$ miss */
     /* place other information here as necessary */
 
 } Pipe_State;
@@ -112,5 +140,10 @@ void pipe_stage_decode();
 void pipe_stage_execute();
 void pipe_stage_mem();
 void pipe_stage_wb();
+
+/* --------- NEW: cache helpers ---------- */
+void cache_init(Cache *c, int num_sets, int num_ways, int block_size);
+int  cache_access(Cache *c, uint32_t addr, int is_store); /* 0=hit, 1=miss */
+void cache_free(Cache *c);
 
 #endif

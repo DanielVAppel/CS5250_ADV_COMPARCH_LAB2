@@ -34,6 +34,12 @@ void pipe_init()
 {
     memset(&pipe, 0, sizeof(Pipe_State));
     pipe.PC = 0x00400000;
+
+    /* ---- NEW: cache init ---- */
+    cache_init(&pipe.icache,  64 /*sets*/, 4 /*ways*/, 32 /*bytes*/);
+    cache_init(&pipe.dcache, 256 /*sets*/, 8 /*ways*/, 32 /*bytes*/);
+    pipe.icache_stall = 0;
+    pipe.dcache_stall = 0;
 }
 
 void pipe_cycle()
@@ -136,6 +142,11 @@ void pipe_stage_wb()
 
 void pipe_stage_mem()
 {
+        /* handle any outstanding D$ stall first */
+    if (pipe.dcache_stall > 0) {
+        pipe.dcache_stall--;
+        return;
+    }
     /* if there is no instruction in this pipeline stage, we are done */
     if (!pipe.mem_op)
         return;
@@ -144,9 +155,21 @@ void pipe_stage_mem()
     Pipe_Op *op = pipe.mem_op;
 
     uint32_t val = 0;
-    if (op->is_mem)
-        val = mem_read_32(op->mem_addr & ~3);
+    if (op->is_mem) {
+         uint32_t aligned_addr = op->mem_addr & ~3U;   /* simulate the cache at word-granularity */
+        int is_store = op->mem_write ? 1 : 0;
+        /* D$ access */
+        if (cache_access(&pipe.dcache, aligned_addr, is_store)) {
+            /* miss → 50 cycles; we have already spent this cycle */
+            pipe.dcache_stall = 50 - 1;
+            return;
+        }
 
+        /* on a load, do the backing store read (this is the architectural memory) */
+        if (!is_store) {
+            val = mem_read_32(aligned_addr);
+        }
+    }
     switch (op->opcode) {
         case OP_LW:
         case OP_LH:
@@ -194,42 +217,38 @@ void pipe_stage_mem()
             }
             break;
 
-        case OP_SB:
-            switch (op->mem_addr & 3) {
-                case 0: val = (val & 0xFFFFFF00) | ((op->mem_value & 0xFF) << 0); break;
-                case 1: val = (val & 0xFFFF00FF) | ((op->mem_value & 0xFF) << 8); break;
-                case 2: val = (val & 0xFF00FFFF) | ((op->mem_value & 0xFF) << 16); break;
-                case 3: val = (val & 0x00FFFFFF) | ((op->mem_value & 0xFF) << 24); break;
+        case OP_SB: {
+                    /* store-byte: merge byte into word then write architectural memory */
+                    uint32_t old = mem_read_32(op->mem_addr & ~3U);
+                    switch (op->mem_addr & 3) {
+                        case 0: old = (old & 0xFFFFFF00) | ((op->mem_value & 0xFF) << 0);  break;
+                        case 1: old = (old & 0xFFFF00FF) | ((op->mem_value & 0xFF) << 8);  break;
+                        case 2: old = (old & 0xFF00FFFF) | ((op->mem_value & 0xFF) << 16); break;
+                        case 3: old = (old & 0x00FFFFFF) | ((op->mem_value & 0xFF) << 24); break;
+                    }
+                    mem_write_32(op->mem_addr & ~3U, old);
+                    break;
+                }
+        case OP_SH: {
+                    /* store-half: merge half into word then write architectural memory */
+                    uint32_t old = mem_read_32(op->mem_addr & ~3U);
+                    if (op->mem_addr & 2)
+                        old = (old & 0x0000FFFF) | ((op->mem_value & 0xFFFF) << 16);
+                    else
+                        old = (old & 0xFFFF0000) |  (op->mem_value & 0xFFFF);
+                    mem_write_32(op->mem_addr & ~3U, old);
+                    break;
+                }
+
+                case OP_SW:
+                    mem_write_32(op->mem_addr & ~3U, op->mem_value);
+                    break;
             }
 
-            mem_write_32(op->mem_addr & ~3, val);
-            break;
-
-        case OP_SH:
-#ifdef DEBUG
-            printf("SH: addr %08x val %04x old word %08x\n", op->mem_addr, op->mem_value & 0xFFFF, val);
-#endif
-            if (op->mem_addr & 2)
-                val = (val & 0x0000FFFF) | (op->mem_value) << 16;
-            else
-                val = (val & 0xFFFF0000) | (op->mem_value & 0xFFFF);
-#ifdef DEBUG
-            printf("new word %08x\n", val);
-#endif
-
-            mem_write_32(op->mem_addr & ~3, val);
-            break;
-
-        case OP_SW:
-            val = op->mem_value;
-            mem_write_32(op->mem_addr & ~3, val);
-            break;
-    }
-
-    /* clear stage input and transfer to next stage */
-    pipe.mem_op = NULL;
-    pipe.wb_op = op;
-}
+            /* clear stage input and transfer to next stage */
+            pipe.mem_op = NULL;
+            pipe.wb_op = op;
+        }
 
 void pipe_stage_execute()
 {
@@ -666,9 +685,22 @@ void pipe_stage_decode()
 
 void pipe_stage_fetch()
 {
+    /* if we are currently stalling due to an I$ miss, count down */
+    if (pipe.icache_stall > 0) {
+        pipe.icache_stall--;
+        return;
+    }
+
     /* if pipeline is stalled (our output slot is not empty), return */
     if (pipe.decode_op != NULL)
         return;
+
+    /* I$ access at the current PC (read) */
+    if (cache_access(&pipe.icache, pipe.PC, 0 /*read*/)) {
+        /* miss → 50 cycles; we have already spent this cycle */
+        pipe.icache_stall = 50 - 1;
+        return;
+    }
 
     /* Allocate an op and send it down the pipeline. */
     Pipe_Op *op = malloc(sizeof(Pipe_Op));
@@ -683,4 +715,97 @@ void pipe_stage_fetch()
     pipe.PC += 4;
 
     stat_inst_fetch++;
+}
+/* ================= CACHE IMPLEMENTATION ================= */
+
+static inline int ilog2(int x) { int n=0; while ((1<<n) < x) n++; return n; }
+
+void cache_init(Cache *c, int num_sets, int num_ways, int block_size)
+{
+    c->num_sets   = num_sets;
+    c->num_ways   = num_ways;
+    c->block_size = block_size;
+    c->offset_bits = ilog2(block_size);  /* 32B -> 5 */
+    c->index_bits  = ilog2(num_sets);    /* 64 -> 6, 256 -> 8 */
+
+    c->sets = (CacheSet*)malloc(sizeof(CacheSet) * num_sets);
+    for (int s = 0; s < num_sets; s++) {
+        c->sets[s].num_ways = num_ways;
+        c->sets[s].blocks = (CacheBlock*)malloc(sizeof(CacheBlock) * num_ways);
+        for (int w = 0; w < num_ways; w++) {
+            c->sets[s].blocks[w].tag = 0;
+            c->sets[s].blocks[w].valid = 0;
+            c->sets[s].blocks[w].dirty = 0;
+            c->sets[s].blocks[w].lru_counter = 0;
+        }
+    }
+}
+
+/* returns 0 on hit, 1 on miss (caller handles 50-cycle stall) */
+int cache_access(Cache *c, uint32_t addr, int is_store)
+{
+    const int ob = c->offset_bits;
+    const int ib = c->index_bits;
+
+    uint32_t block_addr = addr >> ob;
+    uint32_t set_index  = block_addr & ((1u << ib) - 1u);
+    uint32_t tag        = block_addr >> ib;
+
+    CacheSet *set = &c->sets[set_index];
+
+    /* hit? */
+    int hit_way = -1;
+    for (int w = 0; w < set->num_ways; w++) {
+        CacheBlock *b = &set->blocks[w];
+        if (b->valid && b->tag == tag) { hit_way = w; break; }
+    }
+
+    if (hit_way >= 0) {
+        /* update LRU: make this the most recent (max + 1) */
+        uint32_t max_lru = 0;
+        for (int w = 0; w < set->num_ways; w++)
+            if (set->blocks[w].lru_counter > max_lru) max_lru = set->blocks[w].lru_counter;
+        set->blocks[hit_way].lru_counter = max_lru + 1;
+        if (is_store) set->blocks[hit_way].dirty = 1;
+        return 0; /* hit */
+    }
+
+    /* miss: choose invalid way; if none, choose LRU (min counter) */
+    int repl = -1;
+    for (int w = 0; w < set->num_ways; w++) {
+        if (!set->blocks[w].valid) { repl = w; break; }
+    }
+    if (repl < 0) {
+        uint32_t min_lru = set->blocks[0].lru_counter; repl = 0;
+        for (int w = 1; w < set->num_ways; w++) {
+            if (set->blocks[w].lru_counter < min_lru) {
+                min_lru = set->blocks[w].lru_counter; repl = w;
+            }
+        }
+        /* if evicting a dirty block (D$), writeback is instantaneous by spec */
+        set->blocks[repl].dirty = 0; /* conceptually written back */
+    }
+
+    /* install new block as MRU */
+    uint32_t max_lru = 0;
+    for (int w = 0; w < set->num_ways; w++)
+        if (set->blocks[w].lru_counter > max_lru) max_lru = set->blocks[w].lru_counter;
+
+    CacheBlock *nb = &set->blocks[repl];
+    nb->tag   = tag;
+    nb->valid = 1;
+    nb->dirty = is_store ? 1 : 0;
+    nb->lru_counter = max_lru + 1;
+
+    return 1; /* miss */
+}
+
+void cache_free(Cache *c)
+{
+    if (!c || !c->sets) return;
+    for (int s = 0; s < c->num_sets; s++) {
+        free(c->sets[s].blocks);
+    }
+    free(c->sets);
+    c->sets = NULL;
 }
