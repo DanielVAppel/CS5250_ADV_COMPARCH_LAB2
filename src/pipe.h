@@ -1,9 +1,9 @@
 /*
- * Computer Architecture - Professor Onur Mutlu
+ * Computer Architecture - Professor Fatemeh Jamshidi
  *
  * MIPS pipeline timing simulator
  *
- * Chris Fallin, 2012
+ * Daniel Appel, 2025
  */
 
 #ifndef _PIPE_H_
